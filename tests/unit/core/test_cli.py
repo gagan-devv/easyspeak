@@ -166,6 +166,7 @@ def test_run_configure_with_no_items_applies_default(mock_configure):
         ([], None),  # no --configure: run the app
         (["--configure"], {"extension", "service"}),  # empty → default pair
         (["--configure", "autostart"], {"autostart"}),  # explicit items kept
+        (["--configure", "activation"], {"activation"}),
     ],
 )
 def test_parse_args_configure_default(argv, expected):
@@ -186,6 +187,7 @@ def test_run_preview_prints_item_and_skips_app(mock_preview):
     [
         ([], None),  # no --preview: run the app
         (["--preview", "desktop"], "desktop"),  # the single item to print
+        (["--preview", "activation"], "activation"),
     ],
 )
 def test_parse_args_preview(argv, expected):

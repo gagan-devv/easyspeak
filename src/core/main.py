@@ -17,7 +17,10 @@ from pathlib import Path
 import numpy as np
 import pyaudio
 
+from .activation import match_and_strip_activation
 from .config import (
+    ACTIVATION,
+    ACTIVATION_WARNINGS,
     COMMAND_LANGUAGE,
     COMMAND_PROMPT,
     COMMAND_PROMPTS,
@@ -40,6 +43,7 @@ from .config import (
     SILENCE_THRESHOLD_MAX,
     STT,
     STT_WARNINGS,
+    TRANSCRIPT_ACTIVATION_PHRASES,
     WAKE_COOLDOWN,
     WAKE_SOUND,
     WAKE_THRESHOLD,
@@ -74,7 +78,7 @@ WAKE_PREFIXES = (
 )
 
 
-def strip_wake_words(cmd):
+def strip_wake_words(cmd, activation=None):
     """Remove a leading spoken wake word and surrounding punctuation.
 
     Only a prefix is removed. Replacing every occurrence anywhere in the utterance
@@ -84,6 +88,12 @@ def strip_wake_words(cmd):
     of what remains is kept: dictation inserts it as spoken, and every other
     consumer lowercases for itself.
     """
+    mode = activation or ACTIVATION
+    if mode == "transcript":
+        matched, trailing = match_and_strip_activation(cmd)
+        if matched is not None:
+            return trailing
+
     cmd = cmd.strip()
     lowered = cmd.lower()
     for wake in sorted(WAKE_PREFIXES, key=len, reverse=True):
@@ -124,6 +134,7 @@ class EasySpeak:
         self.audio = None
         self.stream = None
         self.last_wake_time = 0
+        self.activation = ACTIVATION
         self.misunderstand_count = 0
         self.help_shown = False
         self.needs_wake_word = False
@@ -701,13 +712,54 @@ class EasySpeak:
 
     # --- Main loop ---
 
+    def _listen_for_transcript_wake(self, timeout=None):
+        """Listen once for speech and match against transcript activation phrases.
+
+        Returns (matched_phrase, trailing_command) if an activation phrase was heard
+        and passed cooldown, otherwise (None, "").
+        """
+        heard = self.wait_for_speech(
+            timeout=timeout if timeout is not None else 0.5,
+            should_continue=lambda: not self.hotkey.is_held(),
+        )
+        if heard is None:
+            return None, ""
+        audio = heard + self.record_until_silence()
+        text = self.transcribe(audio, language=COMMAND_LANGUAGE)
+        if not text:
+            return None, ""
+        matched, trailing = match_and_strip_activation(text)
+        if not matched:
+            return None, ""
+        now = time.time()
+        if now - self.last_wake_time < WAKE_COOLDOWN:
+            return None, ""
+        self.last_wake_time = now
+        logger.info('🎤 Transcript wake! ("%s")', matched)
+        self._reset_detector()
+        self._play_wake_chime()
+        return matched, trailing
+
     def wait_for_wake(self, timeout):
-        """Block until the wake word is heard, then chime. False on timeout.
+        """Block until wake word or activation phrase is heard. False on timeout.
 
         The same detector, cooldown and chime the main loop uses, so a mode that
         asks for the wake word behaves exactly like the wake-word loop does.
         """
         deadline = time.monotonic() + timeout
+        if getattr(self, "activation", ACTIVATION) == "transcript":
+            while True:
+                now = time.monotonic()
+                if now >= deadline:
+                    break
+                remaining = max(0.1, deadline - now)
+                matched, _ = self._listen_for_transcript_wake(
+                    timeout=min(0.5, remaining)
+                )
+                if matched is not None:
+                    return True
+            return False
+
         while time.monotonic() < deadline:
             pcm = self.stream.read(1280, exception_on_overflow=False)
             score = self.wakeword.predict(pcm)
@@ -728,7 +780,8 @@ class EasySpeak:
 
         Stale or half-primed state can't then fire a spurious wake.
         """
-        self.wakeword.reset()
+        if self.wakeword is not None:
+            self.wakeword.reset()
         self.flush_stream()
 
     def play_sound(self, sound):
@@ -797,7 +850,7 @@ class EasySpeak:
         self._play_wake_chime()
         self._push_to_talk(self.hotkey.is_held)
 
-    def _capture_command_session(self):
+    def _capture_command_session(self, initial_command=None):
         """Capture and route commands after a wake, staying open for follow-ups.
 
         The mic stays open after every command, understood or not, so the user can
@@ -818,6 +871,7 @@ class EasySpeak:
         """
         awake = True
         quiet = 0
+        first_round = True
         while True:
             action = self.tray.poll(self._close_stream, self._open_stream)
             if action is TrayAction.QUIT:
@@ -830,12 +884,18 @@ class EasySpeak:
             self.spoke = False
             self.needs_wake_word = False
 
-            heard = self.wait_for_speech(timeout=5)
-            cmd = None
-            if heard is not None:
-                cmd = self.transcribe(
-                    heard + self.record_until_silence(), language=COMMAND_LANGUAGE
-                )
+            if first_round and initial_command:
+                first_round = False
+                cmd = initial_command
+                heard = b"initial"
+            else:
+                first_round = False
+                heard = self.wait_for_speech(timeout=5)
+                cmd = None
+                if heard is not None:
+                    cmd = self.transcribe(
+                        heard + self.record_until_silence(), language=COMMAND_LANGUAGE
+                    )
             if not cmd:
                 if awake:
                     if heard is None:
@@ -874,8 +934,9 @@ class EasySpeak:
         Blocks until the user quits (voice command, tray, or Ctrl-C), always releasing
         the microphone and draining speech on the way out.
         """
-        logger.info("Loading OpenWakeWord...")
-        self.wakeword = WakeWordModel()
+        if self.activation != "transcript":
+            logger.info("Loading OpenWakeWord...")
+            self.wakeword = WakeWordModel()
 
         try:
             if STT == "parakeet":
@@ -898,7 +959,7 @@ class EasySpeak:
         except RuntimeError as exc:
             logger.error("Cannot start EasySpeak: %s", exc)  # noqa: TRY400
             raise SystemExit(1) from exc
-        for warning in (*STT_WARNINGS, *LANGUAGE_WARNINGS):
+        for warning in (*STT_WARNINGS, *LANGUAGE_WARNINGS, *ACTIVATION_WARNINGS):
             logger.warning(warning)
 
         ensure_extension()
@@ -918,14 +979,20 @@ class EasySpeak:
         except OSError:
             logger.warning("Speech unavailable; continuing without it.")
 
-        logger.info("""
+        wake_display = (
+            f'Activation: "{TRANSCRIPT_ACTIVATION_PHRASES[0]}"'
+            if self.activation == "transcript"
+            else f'Wake word: "{WAKE_WORD_SPOKEN}"'
+        )
+        banner = f"""
 ╔══════════════════════════════════════════╗
 ║            EasySpeak                     ║
 ╠══════════════════════════════════════════╣
-║  Wake word: "Hey Jarvis"                 ║
+║  {wake_display:<40}║
 ║  Say "help" for available commands       ║
 ╚══════════════════════════════════════════╝
-""")
+"""
+        logger.info("%s", banner)
 
         try:
             with suppressed_c_stderr():
@@ -939,7 +1006,12 @@ class EasySpeak:
             # Start keyboard (silent) activation; no-op if disabled or no
             # /dev/input access. Plugins have registered their handlers by now.
             self.hotkey.start()
-            logger.info("Listening for wake word...")
+            prompt_label = (
+                "Listening for activation phrase..."
+                if self.activation == "transcript"
+                else "Listening for wake word..."
+            )
+            logger.info(prompt_label)
             audio_buffer = []
 
             while True:
@@ -951,7 +1023,7 @@ class EasySpeak:
                 if action is TrayAction.RESUME:
                     self._reset_detector()
                     audio_buffer = []
-                    logger.info("Listening for wake word...")
+                    logger.info(prompt_label)
                     continue
 
                 # Keyboard activation bypasses the wake word: dictate while held.
@@ -959,7 +1031,17 @@ class EasySpeak:
                     self._run_push_to_talk()
                     self._reset_detector()
                     audio_buffer = []
-                    logger.info("Listening for wake word...")
+                    logger.info(prompt_label)
+                    continue
+
+                if self.activation == "transcript":
+                    matched, trailing = self._listen_for_transcript_wake(timeout=0.5)
+                    if matched is not None:
+                        initial_cmd = trailing or None
+                        if self._capture_command_session(initial_command=initial_cmd):
+                            break
+                        audio_buffer = []
+                        logger.info(prompt_label)
                     continue
 
                 pcm = self.stream.read(1280, exception_on_overflow=False)
@@ -986,7 +1068,7 @@ class EasySpeak:
                         break
 
                     audio_buffer = []
-                    logger.info("Listening for wake word...")
+                    logger.info(prompt_label)
 
         except KeyboardInterrupt:
             logger.info("\nStopped (Ctrl+C).")

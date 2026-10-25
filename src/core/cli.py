@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 def parse_args(argv=None):
     """Parse EasySpeak's command-line arguments."""
-    config_items = {"extension", "service", "autostart", "desktop"}
+    config_items = {"extension", "service", "autostart", "desktop", "activation"}
     config_defaults = {"extension", "service"}
 
     parser = argparse.ArgumentParser(

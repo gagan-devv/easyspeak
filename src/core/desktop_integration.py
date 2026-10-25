@@ -82,6 +82,10 @@ def configure(items: set[str]):
         install_desktop_file()
     if "autostart" in items:
         install_autostart_file()
+    if "activation" in items:
+        from .activation import configure_activation
+
+        configure_activation()
 
 
 def _manifest_text():
@@ -96,11 +100,14 @@ def preview(item):
     just the content off stdout; the content is written verbatim, since adding a
     trailing newline is packaging's concern, not this function's.
     """
+    from .activation import activation_phrases_path, activation_preview_text
+
     render, path = {
         "extension": (_manifest_text, extension_dest_dir),
         "service": (unit_text, unit_path),
         "desktop": (partial(data_text, DESKTOP_TEMPLATE), desktop_path),
         "autostart": (partial(data_text, AUTOSTART_TEMPLATE), autostart_path),
+        "activation": (activation_preview_text, activation_phrases_path),
     }[item]
     sys.stderr.write(f"TARGET: {path()}\n")
     sys.stdout.write(render())

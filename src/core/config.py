@@ -37,6 +37,7 @@ from faster_whisper import WhisperModel
 # rather than at the first dictation.
 from faster_whisper.tokenizer import _LANGUAGE_CODES as LANGUAGE_CODES
 
+from .activation import ACTIVATION_MODES, load_activation_phrases
 from .vocabulary import load_table
 
 logger = logging.getLogger(__name__)
@@ -45,12 +46,25 @@ logger = logging.getLogger(__name__)
 OFFLINE_MODE = os.environ.get("EASYSPEAK_OFFLINE", "strict").strip().lower()
 NETWORK_ALLOWED = OFFLINE_MODE == "relaxed"
 
-# --- Wake word ---
+# --- Wake word and activation ---
 WAKE_WORD = "hey_jarvis"  # OpenWakeWord model name
 
 WAKE_WORD_SPOKEN = "Hey Jarvis"
 WAKE_THRESHOLD = 0.5
 WAKE_COOLDOWN = 3.0  # Seconds to ignore wake word after trigger
+
+ACTIVATION_WARNINGS: list[str] = []
+_activation = os.environ.get("EASYSPEAK_ACTIVATION", "wakeword").strip().lower()
+if _activation and _activation not in ACTIVATION_MODES:
+    ACTIVATION_WARNINGS.append(
+        f"Unknown activation mode {_activation!r} (EASYSPEAK_ACTIVATION), "
+        "using 'wakeword'"
+    )
+    ACTIVATION = "wakeword"
+else:
+    ACTIVATION = _activation or "wakeword"
+
+TRANSCRIPT_ACTIVATION_PHRASES, ACTIVATION_CONFIG_SOURCE = load_activation_phrases()
 
 # Modes normally accept a bare command. With this on they wait for the wake word
 # first, which keeps a speaker playing video from being transcribed as commands.

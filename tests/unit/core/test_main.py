@@ -386,6 +386,20 @@ class TestEasySpeakRouteCommand:
         easy.route_command("jarvis test command")
         mock_plugin.handle.assert_called_with("test command", easy)
 
+    def test_strip_wake_words_transcript_mode(self):
+        """Transcript mode strips configured activation phrases."""
+        from easyspeak.core.main import strip_wake_words
+
+        assert (
+            strip_wake_words("Apollo open files", activation="transcript")
+            == "open files"
+        )
+        assert (
+            strip_wake_words("Hey Apollo, check weather", activation="transcript")
+            == "check weather"
+        )
+        assert strip_wake_words("open files", activation="transcript") == "open files"
+
     def test_route_command_lowercases_what_whisper_capitalized(self, mock_plugin):
         """Plugins match lowercase words; only dictation wants the case kept."""
         easy = EasySpeak()
@@ -2198,3 +2212,71 @@ class TestWaitForWake:
             assert easy.wait_for_wake(timeout=0) is False
 
         easy.stream.read.assert_not_called()
+
+    def test_transcript_activation_wakes(self):
+        """When activation mode is 'transcript', wait_for_wake uses transcript matching."""
+        easy = EasySpeak()
+        easy.activation = "transcript"
+        easy._listen_for_transcript_wake = Mock(return_value=("apollo", "open files"))
+
+        with patch("easyspeak.core.main.time.monotonic", side_effect=[0, 1]):
+            assert easy.wait_for_wake(timeout=5) is True
+
+    def test_transcript_activation_times_out(self):
+        """Transcript mode times out when no activation phrase is heard."""
+        easy = EasySpeak()
+        easy.activation = "transcript"
+        easy._listen_for_transcript_wake = Mock(return_value=(None, ""))
+
+        with patch("easyspeak.core.main.time.monotonic", side_effect=[0, 1, 6]):
+            assert easy.wait_for_wake(timeout=5) is False
+
+
+class TestTranscriptWake:
+    """Tests for transcript wake listener and single-shot command routing."""
+
+    def test_listen_for_transcript_wake_matches(self):
+        easy = EasySpeak()
+        easy.wait_for_speech = Mock(return_value=b"speech")
+        easy.record_until_silence = Mock(return_value=b"")
+        easy.transcribe = Mock(return_value="Apollo, open files")
+        easy._reset_detector = Mock()
+        easy._play_wake_chime = Mock()
+
+        with patch("easyspeak.core.main.time.time", return_value=200.0):
+            matched, trailing = easy._listen_for_transcript_wake()
+
+        assert matched == "Apollo"
+        assert trailing == "open files"
+        assert easy.last_wake_time == 200.0
+        easy._play_wake_chime.assert_called_once()
+        easy._reset_detector.assert_called_once()
+
+    def test_listen_for_transcript_wake_cooldown(self):
+        easy = EasySpeak()
+        easy.last_wake_time = 199.0
+        easy.wait_for_speech = Mock(return_value=b"speech")
+        easy.record_until_silence = Mock(return_value=b"")
+        easy.transcribe = Mock(return_value="Apollo")
+        easy._play_wake_chime = Mock()
+
+        with patch("easyspeak.core.main.time.time", return_value=200.0):
+            matched, _trailing = easy._listen_for_transcript_wake()
+
+        assert matched is None
+        easy._play_wake_chime.assert_not_called()
+
+    def test_capture_command_session_with_initial_command(self):
+        """Single-shot commands skip the initial speech wait and route immediately."""
+        easy = EasySpeak()
+        easy.tray = Mock()
+        easy.tray.poll.return_value = None
+        easy.route_command = Mock(return_value=True)
+        easy.wait_for_speech = Mock(return_value=None)
+        easy._drain_feedback = Mock()
+        easy._reset_detector = Mock()
+
+        result = easy._capture_command_session(initial_command="open files")
+
+        assert result is False
+        easy.route_command.assert_called_once_with("open files")
